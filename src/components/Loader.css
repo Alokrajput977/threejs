@@ -1,0 +1,50 @@
+.loader {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 18px;
+  background: var(--slate-900);
+  z-index: 50;
+  transition: opacity 700ms ease, visibility 700ms;
+}
+
+.loader--done {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none; /* fade ke dauraan bhi clicks 3D scene tak jaayein */
+}
+
+.loader__bricks {
+  display: grid;
+  grid-template-columns: repeat(3, 34px);
+  gap: 4px;
+}
+
+.loader__bricks span {
+  height: 14px;
+  border-radius: 2px;
+  background: #9c4430;
+  animation: brick 1.2s ease-in-out infinite;
+}
+
+.loader__bricks span:nth-child(n + 4) {
+  transform: translateX(17px);
+}
+
+.loader__text {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+@keyframes brick {
+  0%,
+  100% {
+    opacity: 0.25;
+  }
+  50% {
+    opacity: 1;
+  }
+}

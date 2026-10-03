@@ -1,0 +1,59 @@
+:root {
+  /* Site palette */
+  --slate-900: #15232c;
+  --slate-800: #1c2e39;
+  --slate-700: #29404d;
+  --line: rgba(160, 190, 205, 0.16);
+  --text: #eef2f1;
+  --muted: #97a8b0;
+  --marking: #f2c230; /* site marking paint */
+  --patina: #6fc2a8; /* open state */
+  --panel: rgba(21, 35, 44, 0.84);
+
+  --font: 'Archivo', 'Segoe UI', system-ui, sans-serif;
+  --radius-lg: 14px;
+  --radius-sm: 8px;
+
+  color-scheme: dark;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  font-family: var(--font);
+  font-variation-settings: 'wdth' 100;
+  color: var(--text);
+  background: var(--slate-900);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--marking);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
