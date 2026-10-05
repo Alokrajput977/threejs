@@ -8,7 +8,7 @@ const HALL_VIEWS = {
   'hall:west': { pos: [-22, 3.4, 3], target: [-38.6, 3.9, -8] },
   'hall:east': { pos: [22, 3.4, -3], target: [38.6, 3.9, 8] },
   'hall:roof': { pos: [-12, 1.9, 19], target: [4, 11.5, -6] },
-  'hall:overview': { pos: [34, 9, 25], target: [-6, 1, -6] },
+  'hall:overview': { pos: [32, 9, 14], target: [-6, 1, -8] }, // front block ke bahar
   'hall:reception': { pos: [0.5, 1.9, 27.0], target: [-4, 1.0, 20.6] },
   'hall:manager': { pos: [14.4, 1.9, 20.0], target: [24, 1.1, 26] },
   'hall:owner': { pos: [28.4, 1.9, 20.0], target: [35, 1.1, 25.5] },

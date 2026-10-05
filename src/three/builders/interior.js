@@ -33,37 +33,161 @@ export function hallDims() {
   return { W, L, H, F, Rr, cy, floorY, centerZ };
 }
 
-/* ================= Lights (startup par bante hain, intensity 0) ================= */
+/* ================= Lights ================= */
+/*
+ * PERFORMANCE: Three.js mein har light (intensity 0 wali bhi) har pixel par
+ * calculate hoti hai. Isliye interior lights sirf ANDAR hone par visible hoti hain
+ * (bahar scene mein count hi nahi hoti), aur 11 ki jagah 7 lights hain –
+ * thodi tez karke same roshni milti hai.
+ */
 export function createInteriorLights() {
   const d = hallDims();
   const g = new THREE.Group();
   g.name = 'hall-interior-lights';
   g.position.set(0, d.floorY, d.centerZ);
+  g.visible = false;
   const lights = [];
-  [-28, -9.5, 9.5, 28].forEach((x) => {
-    [-12, 12].forEach((z) => {
-      const l = new THREE.PointLight('#fff3e0', 0, 50, 2);
+  [-24, 0, 24].forEach((x) => {
+    [-11, 11].forEach((z) => {
+      const l = new THREE.PointLight('#fff3e0', 175, 58, 2);
       l.position.set(x, d.H - 2.4, z);
       g.add(l);
       lights.push(l);
     });
   });
-  // Front block (manager/owner, first floor, toilets) – har floor par ek light
-  [3.0, 6.5, 10.0].forEach((y) => {
-    const l = new THREE.PointLight('#fff1dc', 0, 20, 2);
-    l.position.set(24, y, 24);
-    l.userData.blockLight = true;
-    g.add(l);
-    lights.push(l);
-  });
+  // Front block (manager/owner, first floor, toilets) – ek light, beech ke floor par
+  const block = new THREE.PointLight('#fff1dc', 70, 26, 2);
+  block.position.set(24, 6.0, 24);
+  g.add(block);
+  lights.push(block);
   return {
     group: g,
     setOn(on) {
-      lights.forEach((l) => {
-        l.intensity = on ? (l.userData.blockLight ? 35 : 140) : 0;
-      });
+      g.visible = on;
     },
   };
+}
+
+/* ================= Static mesh merging (draw calls kam) ================= */
+/*
+ * Interior mein ~2000+ chhote meshes the (har box alag draw call).
+ * Yahan same tarah ke material wale saare static meshes ko EK mesh mein jod dete hain.
+ * Sirf rang alag ho to vertex colors use hote hain – dikhne mein bilkul same rehta hai.
+ * Glass ko alag bucket mein jodte hain; multi-material (steps, slabs) ke faces bhi split karke jodte hain.
+ * Instanced aur special renderOrder (shadow blobs, pit stencil) wale meshes chhod diye jaate hain.
+ */
+const KEEP = ['position', 'normal', 'uv'];
+
+function materialKey(m) {
+  return [
+    m.uuid && m.transparent ? `t${m.opacity}` : 'o',
+    m.type, m.map?.uuid, m.emissiveMap?.uuid, m.bumpMap?.uuid, m.alphaMap?.uuid,
+    m.roughness, m.metalness, m.emissive?.getHex(), m.emissiveIntensity,
+    m.side, m.alphaTest, m.flatShading, m.polygonOffset, m.polygonOffsetFactor, m.polygonOffsetUnits,
+    m.depthWrite, m.depthTest, m.colorWrite, m.clearcoat, m.clearcoatRoughness,
+  ].join('|');
+}
+
+function mergeStatic(root, collector) {
+  root.updateMatrixWorld(true);
+  const inv = new THREE.Matrix4().copy(root.matrixWorld).invert();
+  const rel = new THREE.Matrix4();
+  const buckets = new Map();
+
+  const add = (key, item) => {
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push(item);
+  };
+  const ok = (m) => m && !m.vertexColors && (m.isMeshStandardMaterial || m.isMeshBasicMaterial);
+  const victims = [];
+
+  root.traverse((o) => {
+    if (!o.isMesh || o.isInstancedMesh || o.userData.noMerge || o.renderOrder !== 0) return;
+    const a = o.geometry.attributes;
+    if (!a.position || !a.normal || !a.uv) return;
+    if (Array.isArray(o.material)) {
+      // Multi-material (steps, slabs): har face-group ko apne material ke bucket mein
+      if (!o.material.every(ok) || !o.geometry.groups.length) return;
+      const flat = o.geometry.index ? o.geometry.toNonIndexed() : o.geometry;
+      flat.groups.forEach((grp) => {
+        const mat = o.material[grp.materialIndex];
+        add(materialKey(mat), { mesh: o, material: mat, geometry: flat, start: grp.start, count: grp.count });
+      });
+      victims.push(o);
+      return;
+    }
+    if (!ok(o.material)) return;
+    add(materialKey(o.material), { mesh: o, material: o.material, geometry: o.geometry });
+  });
+
+  const slice = (geo, start, count) => {
+    const out = new THREE.BufferGeometry();
+    KEEP.forEach((n) => {
+      const attr = geo.attributes[n];
+      out.setAttribute(n, new THREE.BufferAttribute(attr.array.slice(start * attr.itemSize, (start + count) * attr.itemSize), attr.itemSize));
+    });
+    return out;
+  };
+
+  let merges = 0;
+  const merged = new Set();
+  buckets.forEach((list) => {
+    const isMulti = list.some((it) => it.start !== undefined);
+    if (list.length < 2 && !isMulti) return;
+    const useColors = new Set(list.map((it) => it.material.color.getHex())).size > 1;
+    const geos = list.map((it) => {
+      let geo;
+      if (it.start !== undefined) geo = slice(it.geometry, it.start, it.count);
+      else geo = it.geometry.index ? it.geometry.toNonIndexed() : it.geometry.clone();
+      Object.keys(geo.attributes).forEach((n) => {
+        if (!KEEP.includes(n)) geo.deleteAttribute(n);
+      });
+      geo.morphAttributes = {};
+      geo.clearGroups();
+      rel.multiplyMatrices(inv, it.mesh.matrixWorld);
+      geo.applyMatrix4(rel);
+      if (useColors) {
+        const c = it.material.color;
+        const n = geo.attributes.position.count;
+        const arr = new Float32Array(n * 3);
+        for (let i = 0; i < n; i++) {
+          arr[i * 3] = c.r;
+          arr[i * 3 + 1] = c.g;
+          arr[i * 3 + 2] = c.b;
+        }
+        geo.setAttribute('color', new THREE.BufferAttribute(arr, 3));
+      }
+      return geo;
+    });
+    const geo = mergeGeometries(geos, false);
+    geos.forEach((x) => x.dispose());
+    if (!geo) return;
+
+    let material = list[0].material;
+    if (useColors) {
+      material = material.clone();
+      material.vertexColors = true;
+      material.color.set('#ffffff');
+      collector.ownMaterials.push(material);
+    }
+    const out = new THREE.Mesh(geo, material);
+    out.castShadow = false;
+    out.receiveShadow = true;
+    if (material.transparent) out.renderOrder = 2; // glass hamesha opaque ke baad
+    root.add(out);
+    list.forEach((it) => merged.add(it.mesh));
+    merges++;
+  });
+  merged.forEach((o) => o.parent && o.parent.remove(o));
+  victims.forEach((o) => o.parent && o.parent.remove(o));
+
+  // Khali groups hata do
+  const empties = [];
+  root.traverse((o) => {
+    if (o !== root && o.isGroup && o.children.length === 0) empties.push(o);
+  });
+  empties.forEach((o) => o.parent && o.parent.remove(o));
+  return merges;
 }
 
 /* ================= Canvas helpers ================= */
@@ -958,6 +1082,9 @@ export function buildInterior(mats, collector) {
   g.traverse((o) => {
     o.castShadow = false;
   });
+
+  // Hazaron chhote meshes -> kuch hi merged meshes (same look, bahut kam draw calls)
+  mergeStatic(g, collector);
 
   return { group: g };
 }

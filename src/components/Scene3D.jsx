@@ -8,7 +8,19 @@ import { getView } from '../three/cameraViews.js';
 import { hallDims } from '../three/builders/interior.js';
 import './Scene3D.css';
 
+/*
+ * LIGHTWEIGHT RENDERING
+ *  1. On-demand render: kuch na hile to frame render hi nahi hota (GPU aaram karta hai,
+ *     system garam nahi hota). Camera, fly, walk, gate animation par hi render.
+ *  2. Shadow cache: shadow map sirf tab dobara banta hai jab scene badle (gate hile,
+ *     fence/andar-bahar toggle). Camera ghumane par purani shadow hi use hoti hai.
+ *  3. Sasta picking: building ke liye bounding box se raycast (hazaron meshes nahi),
+ *     aur mouse hover ka raycast ~16 baar/second tak limited.
+ *  4. Adaptive sharpness: camera hilte waqt thoda kam pixel ratio, rukte hi full quality.
+ */
+
 const easeInOut = (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+const GATE_ANIM_MS = 3500; // gate khulne/band hone ki animation ka time
 
 export default function Scene3D({ view, night, gates, wallStyle, fence, interior, onGateClick, onHallClick, onReady }) {
   const mountRef = useRef(null);
@@ -23,12 +35,17 @@ export default function Scene3D({ view, night, gates, wallStyle, fence, interior
     const width = mount.clientWidth;
     const height = mount.clientHeight;
 
+    const fullDPR = Math.min(window.devicePixelRatio, 1.75);
+    const moveDPR = Math.min(fullDPR, 1.25);
+    let curDPR = fullDPR;
+
     // stencil: true – foam pit ka 'chhed' dikhane ke liye zaroori
     const renderer = new THREE.WebGLRenderer({ antialias: true, stencil: true, powerPreference: 'high-performance' });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
+    renderer.setPixelRatio(curDPR);
     renderer.setSize(width, height);
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.autoUpdate = false; // hum khud batayenge kab shadow dobara banani hai
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 0.9;
     renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -52,24 +69,42 @@ export default function Scene3D({ view, night, gates, wallStyle, fence, interior
     const campus = buildCampus(textures);
     scene.add(campus.group);
 
+    // ---- Render scheduling ----
+    let needRender = true;
+    let busyUntil = 0; // is time tak lagatar render (animations)
+    let shadowDirty = true;
+    let shadowBusyUntil = 0;
+    const invalidate = (ms = 0) => {
+      needRender = true;
+      if (ms) busyUntil = Math.max(busyUntil, performance.now() + ms);
+    };
+    const dirtyShadows = (ms = 0) => {
+      shadowDirty = true;
+      if (ms) shadowBusyUntil = Math.max(shadowBusyUntil, performance.now() + ms);
+      invalidate(ms);
+    };
+
     // ---- Walk mode (andar): scroll / W A S D / Q E ----
     const walk = { vel: new THREE.Vector3(), keys: new Set() };
     const fwd = new THREE.Vector3();
     const right = new THREE.Vector3();
     const onWheel = (e) => {
-      if (!interiorRef.current) return; // bahar normal zoom
+      if (!interiorRef.current) return; // bahar normal zoom (OrbitControls)
       e.preventDefault();
       camera.getWorldDirection(fwd);
       walk.vel.addScaledVector(fwd, -e.deltaY * 0.035);
       if (walk.vel.length() > 14) walk.vel.setLength(14);
       fly.active = false;
+      invalidate();
     };
+    const WALK_KEYS = ['w', 'a', 's', 'd', 'q', 'e', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'];
     const onKey = (e) => {
       if (e.target && /input|textarea/i.test(e.target.tagName)) return;
       const k = e.key.toLowerCase();
-      if (!['w', 'a', 's', 'd', 'q', 'e', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) return;
+      if (!WALK_KEYS.includes(k)) return;
       if (e.type === 'keydown') walk.keys.add(k);
       else walk.keys.delete(k);
+      invalidate();
     };
     const clearKeys = () => walk.keys.clear();
     renderer.domElement.addEventListener('wheel', onWheel, { passive: false });
@@ -89,15 +124,34 @@ export default function Scene3D({ view, night, gates, wallStyle, fence, interior
       fly.dur = id.startsWith('hall:') && !interiorRef.current ? 2.2 : dur;
       fly.active = true;
       walk.vel.set(0, 0, 0);
+      invalidate();
     };
     controls.addEventListener('start', () => {
       fly.active = false; // user drag kare to animation ruk jaye
     });
+    controls.addEventListener('change', () => invalidate());
     flyTo('aerial', 2.4); // opening shot
 
-    // ---- Click on gate = open/close ----
+    // ---- Picking: gates (leaves) + building (bounding box – bahut sasta) ----
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
+    const hallBox = new THREE.Box3().setFromObject(campus.hall);
+    const boxHit = new THREE.Vector3();
+    const setPointer = (e) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+    };
+    const pick = () => {
+      const gateHit = raycaster.intersectObjects(campus.gateLeaves, true)[0];
+      const p = raycaster.ray.intersectBox(hallBox, boxHit);
+      const hallDist = p ? p.distanceTo(raycaster.ray.origin) : Infinity;
+      if (gateHit && gateHit.distance <= hallDist) return { gateId: gateHit.object.userData.gateId };
+      if (p) return { hall: true };
+      return null;
+    };
+
     let downAt = null;
     const onDown = (e) => {
       downAt = { x: e.clientX, y: e.clientY };
@@ -106,29 +160,25 @@ export default function Scene3D({ view, night, gates, wallStyle, fence, interior
       if (!downAt) return;
       const moved = Math.hypot(e.clientX - downAt.x, e.clientY - downAt.y);
       downAt = null;
-      if (moved > 5) return;
-      const rect = renderer.domElement.getBoundingClientRect();
-      pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-      pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-      raycaster.setFromCamera(pointer, camera);
-      if (interiorRef.current) return; // andar ho to click se kuch nahi
-      const hit = raycaster.intersectObjects([...campus.gateLeaves, campus.hall], true)[0];
+      if (moved > 5 || interiorRef.current) return; // andar ho to click se kuch nahi
+      setPointer(e);
+      const hit = pick();
       if (!hit) return;
-      if (hit.object.userData.gateId) callbacks.current.onGateClick?.(hit.object.userData.gateId);
+      if (hit.gateId) callbacks.current.onGateClick?.(hit.gateId);
       else callbacks.current.onHallClick?.(); // building par click = andar jao
     };
+    let lastHover = 0;
     const onMove = (e) => {
       if (e.buttons) return;
-      const rect = renderer.domElement.getBoundingClientRect();
-      pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-      pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
       if (interiorRef.current) {
         renderer.domElement.style.cursor = '';
         return;
       }
-      raycaster.setFromCamera(pointer, camera);
-      const hit = raycaster.intersectObjects([...campus.gateLeaves, campus.hall], true)[0];
-      renderer.domElement.style.cursor = hit ? 'pointer' : '';
+      const now = performance.now();
+      if (now - lastHover < 60) return; // hover raycast limit
+      lastHover = now;
+      setPointer(e);
+      renderer.domElement.style.cursor = pick() ? 'pointer' : '';
     };
     renderer.domElement.addEventListener('pointerdown', onDown);
     renderer.domElement.addEventListener('pointerup', onUp);
@@ -142,6 +192,7 @@ export default function Scene3D({ view, night, gates, wallStyle, fence, interior
       renderer.setSize(w, h);
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
+      invalidate();
     });
     ro.observe(mount);
 
@@ -156,12 +207,17 @@ export default function Scene3D({ view, night, gates, wallStyle, fence, interior
       y1: hd.floorY + hd.H + 2.5,
       ty1: hd.floorY + hd.H + 3.5,
     };
+    const clamp = THREE.MathUtils.clamp;
 
     // ---- Loop ----
     const clock = new THREE.Clock();
     let firstFrame = true;
+    let lastMoveTime = 0;
     renderer.setAnimationLoop(() => {
       const dt = Math.min(clock.getDelta(), 0.1);
+      const now = performance.now();
+
+      // Fly animation
       if (fly.active) {
         fly.t = Math.min(1, fly.t + dt / fly.dur);
         const k = easeInOut(fly.t);
@@ -175,9 +231,11 @@ export default function Scene3D({ view, night, gates, wallStyle, fence, interior
             controls.target.copy(camera.position).addScaledVector(fwd, 1.2);
           }
         }
+        needRender = true;
       }
 
       // Walk movement (smooth, damping ke saath)
+      let walking = false;
       if (interiorRef.current) {
         const k = walk.keys;
         const f = (k.has('w') || k.has('arrowup') ? 1 : 0) - (k.has('s') || k.has('arrowdown') ? 1 : 0);
@@ -199,20 +257,49 @@ export default function Scene3D({ view, night, gates, wallStyle, fence, interior
           camera.position.add(step);
           controls.target.add(step);
           walk.vel.multiplyScalar(Math.exp(-dt * 4.5));
+          walking = true;
+        } else {
+          walk.vel.set(0, 0, 0);
         }
       } else {
         walk.vel.set(0, 0, 0);
       }
-      campus.update(dt);
-      controls.update();
+
+      // Damping chalta rahe – camera hila to true
+      const moved = controls.update();
+
       // Andar ho to camera building ki deewaron ke andar hi rahe
       if (interiorRef.current && !fly.active) {
-        camera.position.x = THREE.MathUtils.clamp(camera.position.x, bounds.x0, bounds.x1);
-        camera.position.y = THREE.MathUtils.clamp(camera.position.y, bounds.y0, bounds.y1);
-        camera.position.z = THREE.MathUtils.clamp(camera.position.z, bounds.z0, bounds.z1);
-        controls.target.x = THREE.MathUtils.clamp(controls.target.x, bounds.x0, bounds.x1);
-        controls.target.y = THREE.MathUtils.clamp(controls.target.y, bounds.y0, bounds.ty1);
-        controls.target.z = THREE.MathUtils.clamp(controls.target.z, bounds.z0, bounds.z1);
+        camera.position.x = clamp(camera.position.x, bounds.x0, bounds.x1);
+        camera.position.y = clamp(camera.position.y, bounds.y0, bounds.y1);
+        camera.position.z = clamp(camera.position.z, bounds.z0, bounds.z1);
+        controls.target.x = clamp(controls.target.x, bounds.x0, bounds.x1);
+        controls.target.y = clamp(controls.target.y, bounds.y0, bounds.ty1);
+        controls.target.z = clamp(controls.target.z, bounds.z0, bounds.z1);
+      }
+
+      // Adaptive pixel ratio: hilte waqt halka, rukte hi full quality
+      const interacting = moved || fly.active || walking;
+      if (interacting) {
+        lastMoveTime = now;
+        if (curDPR !== moveDPR) {
+          curDPR = moveDPR;
+          renderer.setPixelRatio(curDPR);
+        }
+      } else if (curDPR !== fullDPR && now - lastMoveTime > 220) {
+        curDPR = fullDPR;
+        renderer.setPixelRatio(curDPR);
+        needRender = true;
+      }
+
+      const animating = now < busyUntil;
+      if (!(needRender || interacting || animating)) return; // kuch nahi badla – frame skip
+      needRender = false;
+
+      campus.update(dt);
+      if (shadowDirty || now < shadowBusyUntil) {
+        renderer.shadowMap.needsUpdate = true;
+        shadowDirty = false;
       }
       renderer.render(scene, camera);
       if (firstFrame) {
@@ -221,7 +308,7 @@ export default function Scene3D({ view, night, gates, wallStyle, fence, interior
       }
     });
 
-    apiRef.current = { campus, env, flyTo, controls, scene };
+    apiRef.current = { campus, env, flyTo, controls, scene, invalidate, dirtyShadows };
 
     return () => {
       renderer.setAnimationLoop(null);
@@ -258,6 +345,7 @@ export default function Scene3D({ view, night, gates, wallStyle, fence, interior
       api.scene.environmentIntensity *= 0.35;
       api.env.hemi.intensity *= 0.4;
     }
+    api.invalidate();
   };
 
   useEffect(() => {
@@ -266,15 +354,20 @@ export default function Scene3D({ view, night, gates, wallStyle, fence, interior
   }, [night]);
 
   useEffect(() => {
-    Object.entries(gates).forEach(([id, open]) => apiRef.current?.campus.setGateOpen(id, open));
+    const api = apiRef.current;
+    if (!api) return;
+    Object.entries(gates).forEach(([id, open]) => api.campus.setGateOpen(id, open));
+    api.dirtyShadows(GATE_ANIM_MS); // gate hilte waqt render + shadow update
   }, [gates]);
 
   useEffect(() => {
     apiRef.current?.campus.setWallStyle(wallStyle);
+    apiRef.current?.invalidate();
   }, [wallStyle]);
 
   useEffect(() => {
     apiRef.current?.campus.setFence(fence);
+    apiRef.current?.dirtyShadows();
   }, [fence]);
 
   // Building ke andar / bahar
@@ -284,6 +377,7 @@ export default function Scene3D({ view, night, gates, wallStyle, fence, interior
     if (!api) return;
     api.campus.setInterior(interior);
     applyLighting();
+    api.dirtyShadows();
     const c = api.controls;
     if (interior) {
       // Andar: scroll = chalna (zoom nahi), drag = 360° dekhna
